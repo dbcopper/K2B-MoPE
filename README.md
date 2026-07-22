@@ -74,4 +74,4 @@ The key independent evaluation table used by the manuscript contains 80 plot-lev
 
 ## License
 
-Choose a license before publishing the GitHub repository. See `LICENSE_CHOOSE_BEFORE_UPLOAD.md`.
+This project is released under the MIT License. See `LICENSE`.

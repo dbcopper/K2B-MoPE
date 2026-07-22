@@ -7,5 +7,4 @@ authors:
     given-names: "Ce"
 repository-code: "https://github.com/your-org/k2b-mope"
 date-released: 2026-07-12
-license: "NOASSERTION"
-
+license: "MIT"
