@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Data and generated outputs
+raw_dataset*/
+dataset/
+discussion_dataset/
+output_results/
+experiment_results/
+experiment4_benchmark_results/
+runs/
+discussions/
+results/**
+!results/README.md
+*.xlsx
+*.xls
+*.csv
+*.tsv
+*.dng
+*.DNG
+*.jpg
+*.jpeg
+*.png
+*.tif
+*.tiff
+*.pdf
+*.pptx
+*.docx
+
+# Model/checkpoint binaries
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.npz
+*.npy

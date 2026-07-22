@@ -1,0 +1,14 @@
+numpy
+pandas
+scipy
+matplotlib
+opencv-python
+scikit-image
+scikit-learn
+Pillow
+imageio
+tqdm
+torch
+torchvision
+cellpose
+

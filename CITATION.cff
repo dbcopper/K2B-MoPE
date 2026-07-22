@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+title: "K2B-MoPE: Kernel-to-Batch Mixture of Phenotypic Experts for Wheat FHB Severity Assessment"
+message: "If you use this code, please cite the associated manuscript."
+type: software
+authors:
+  - family-names: "Yang"
+    given-names: "Ce"
+repository-code: "https://github.com/your-org/k2b-mope"
+date-released: 2026-07-12
+license: "NOASSERTION"
+
