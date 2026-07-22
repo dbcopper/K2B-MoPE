@@ -42,6 +42,18 @@ Force retraining from `examples/Healthy/` and `examples/Diseased/`:
 python few_shot_cellpose_mope_ranking.py --retrain
 ```
 
+## Demo data
+
+A minimal public demo is included under `demo/`. It contains one metadata-stripped RGB multi-kernel image, one healthy kernel crop, one diseased kernel crop, and a small example prediction table showing the expected CSV schema.
+
+If you have placed a trained checkpoint under `output_results/MoPE_Ranking/` or populated `examples/Healthy/` and `examples/Diseased/` with sufficient training crops, the demo image can be processed with:
+
+```bash
+python few_shot_cellpose_mope_ranking.py --images demo/images/demo_multikernel_rgb.jpg
+```
+
+The demo files are intended for checking the data format and repository layout. They are not a replacement for the full evaluation set used in the manuscript.
+
 Run the main model rebuild workflow if the expected `data/seeds_png/` folders are available:
 
 ```bash

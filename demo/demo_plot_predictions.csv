@@ -1,0 +1,2 @@
+year,plot,line,manual_vsk_pct,svm_predicted_vsk_pct,rf_predicted_vsk_pct,resnet18_predicted_vsk_pct,vit_predicted_vsk_pct,mope_predicted_vsk_pct
+2025,demo_plot_001,demo_line,NA,NA,NA,NA,NA,NA

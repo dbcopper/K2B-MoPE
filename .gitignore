@@ -46,3 +46,7 @@ results/**
 *.onnx
 *.npz
 *.npy
+
+# Keep the small public demo dataset.
+!demo/
+!demo/**
