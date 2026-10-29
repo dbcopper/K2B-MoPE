@@ -5,6 +5,7 @@ import json
 import random
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
@@ -57,7 +58,10 @@ DEFAULT_TRAINING_ROOT = (
     ROOT / "output_results" / "current_seed_models" / "training_examples"
 )
 DEFAULT_MODEL_ROOT = ROOT / "results" / "result2" / "models"
-DEFAULT_OUTPUT_DIR = ROOT / "results" / "result5_method_comparison"
+RUN_ID = datetime.now(timezone.utc).strftime("run_%Y%m%dT%H%M%S_%fZ")
+DEFAULT_OUTPUT_DIR = (
+    ROOT / "results" / "result5_method_comparison_fdg_pooled_reference_v1" / RUN_ID
+)
 
 MODEL_INFO = {
     "svm_standard": {
@@ -419,13 +423,16 @@ def aggregate_rank_scores(
 ) -> pd.DataFrame:
     scored = kernel_df[["year", "plot"]].copy()
     scored["score"] = scores
-    reference_mean = float(np.concatenate([healthy_scores, diseased_scores]).mean())
+    healthy_mean = float(healthy_scores.mean())
     diseased_mean = float(diseased_scores.mean())
     rows = []
     for (year, plot), group in scored.groupby(["year", "plot"], sort=False):
         sample_scores = group["score"].to_numpy(dtype=float)
-        threshold = diseased_mean + lambda_value * (
-            float(sample_scores.mean()) - reference_mean
+        threshold = mope.compute_vsk_threshold(
+            healthy_mean=healthy_mean,
+            diseased_mean=diseased_mean,
+            target_mean=float(sample_scores.mean()),
+            lambda_value=lambda_value,
         )
         rows.append(
             {
@@ -658,7 +665,7 @@ def main() -> None:
     if args.n_bootstrap < 100:
         raise ValueError("--n-bootstrap must be at least 100.")
     set_seed(args.seed)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    args.output_dir.mkdir(parents=True, exist_ok=False)
 
     kernel_df = pd.read_csv(args.kernel_predictions)
     plot_df = pd.read_csv(args.plot_predictions)

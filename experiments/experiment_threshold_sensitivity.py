@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import matplotlib
@@ -16,6 +17,10 @@ ROOT = Path(__file__).resolve().parents[1]
 EXPERIMENT_DIR = Path(__file__).resolve().parent
 if str(EXPERIMENT_DIR) not in sys.path:
     sys.path.insert(0, str(EXPERIMENT_DIR))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import few_shot_cellpose_mope_ranking as mope
 
 from experiment_generalization_existing_data import (
     bootstrap_distributions,
@@ -33,7 +38,8 @@ DEFAULT_PLOT_CSV = (
     ROOT / "results" / "result2" / "per_plot" / "table8_per_plot_predictions.csv"
 )
 DEFAULT_THRESHOLD_INFO = ROOT / "results" / "result2" / "models" / "threshold_info.json"
-DEFAULT_OUTPUT_DIR = ROOT / "results" / "result6_threshold_sensitivity"
+RUN_ID = datetime.now(timezone.utc).strftime("run_%Y%m%dT%H%M%S_%fZ")
+DEFAULT_OUTPUT_DIR = ROOT / "results" / "result6_threshold_sensitivity_fdg_pooled_reference_v1" / RUN_ID
 DEFAULT_LAMBDAS = [0.0, 0.1, 0.2, 0.25, 0.3, 0.5, 0.75, 1.0]
 METRICS = ["pearson_r", "spearman_rho", "mae", "rmse", "bias"]
 
@@ -65,7 +71,6 @@ def aggregate_predictions(
     healthy_mean: float,
     diseased_mean: float,
 ) -> pd.DataFrame:
-    reference_mean = (healthy_mean + diseased_mean) / 2.0
     rows = []
     for (year, plot), group in kernel_df.groupby(["year", "plot"], sort=False):
         scores = group["mope_score"].to_numpy(dtype=float)
@@ -77,7 +82,12 @@ def aggregate_predictions(
         }
         for value in lambdas:
             key = lambda_key(value)
-            threshold = diseased_mean + value * (float(scores.mean()) - reference_mean)
+            threshold = mope.compute_vsk_threshold(
+                healthy_mean=healthy_mean,
+                diseased_mean=diseased_mean,
+                target_mean=float(scores.mean()),
+                lambda_value=value,
+            )
             row[f"{key}_threshold"] = float(threshold)
             row[f"{key}_prediction"] = float(np.mean(scores >= threshold) * 100.0)
         rows.append(row)

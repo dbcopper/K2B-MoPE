@@ -6,6 +6,27 @@ This repository contains the code release accompanying the manuscript:
 
 > K2B-MoPE: An Efficient Mixture of Phenotypic Experts Framework for Interpretable Kernel-to-Batch Fusarium Head Blight Severity Assessment in Wheat
 
+## Model implementation correction
+
+The current implementation follows the revised Methods: z-score statistics are
+estimated from the pooled Healthy and Diseased training kernels; each feature
+group contributes its mean absolute standardized deviation; a softmax uses one
+learned positive temperature. The fixed primary training schedule is 16 epochs
+with seed 42. The VSK threshold uses a class-balanced midpoint of the two training
+class mean scores, coefficient 0.25, and a `score >= threshold` count. Cellpose
+uses `cyto` with a fixed diameter of 95 pixels.
+
+New segmentation requires Cellpose 3 (`cellpose>=3.1,<4`). Cellpose 4 is
+explicitly rejected rather than silently substituting CPSAM for `cyto`.
+Mask caches use a new model-and-diameter schema to avoid reusing unidentified
+legacy masks.
+
+Checkpoints must use schema `fdg_pooled_reference_v1`. Legacy 25-to-3 linear-gate
+and healthy-only checkpoints are rejected and must be retrained into a new
+output directory. This code correction does not regenerate or validate the
+manuscript's numerical results. See `docs/CODE_CORRECTION_20261029.md` for the
+implementation and result-provenance boundaries.
+
 ## What is included
 
 - `few_shot_cellpose_mope_ranking.py`: core SeedPose/Cellpose + MoPE ranking pipeline.
@@ -46,7 +67,10 @@ python few_shot_cellpose_mope_ranking.py --retrain
 
 A minimal public demo is included under `demo/`. It contains one metadata-stripped RGB multi-kernel image, one healthy kernel crop, one diseased kernel crop, and a small example prediction table showing the expected CSV schema.
 
-If you have placed a trained checkpoint under `output_results/MoPE_Ranking/` or populated `examples/Healthy/` and `examples/Diseased/` with sufficient training crops, the demo image can be processed with:
+If you have placed a compatible trained checkpoint under
+`output_results/MoPE_Ranking_FDG_PooledReference_v1/` or populated
+`examples/Healthy/` and `examples/Diseased/` with sufficient training crops, the
+demo image can be processed with:
 
 ```bash
 python few_shot_cellpose_mope_ranking.py --images demo/images/demo_multikernel_rgb.jpg

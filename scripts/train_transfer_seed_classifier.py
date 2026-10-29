@@ -154,7 +154,7 @@ def draw_prediction_overlay(image_bgr, records):
 def load_or_segment_instances(image_bgr: np.ndarray, image_name: str, cache_dir: Path) -> np.ndarray:
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     cache_path = cache_dir / (
-        f"cellpose_betterroi_d{base_pipeline.CELLPOSE_FIXED_DIAMETER}_"
+        f"{base_pipeline.CELLPOSE_CACHE_SCHEMA}_"
         f"{image_name}_{gray.shape[0]}x{gray.shape[1]}.npz"
     )
     if cache_path.exists():
@@ -167,12 +167,7 @@ def load_or_segment_instances(image_bgr: np.ndarray, image_name: str, cache_dir:
         return masks
 
     use_gpu = torch.cuda.is_available()
-    from cellpose import models
-
-    try:
-        cellpose_model = models.CellposeModel(gpu=use_gpu)
-    except Exception:
-        cellpose_model = models.Cellpose(gpu=use_gpu, model_type=base_pipeline.CELLPOSE_MODEL)
+    cellpose_model = base_pipeline.create_cellpose_model(use_gpu=use_gpu)
 
     masks = base_pipeline.stitch_roi_masks(
         cellpose_model,

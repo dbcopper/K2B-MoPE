@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import argparse
 import json
 import shutil
 import sys
 from pathlib import Path
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -26,23 +28,38 @@ from experiment_mope_seed_stability import (
 )
 
 
-RUN_ROOT = ROOT / "results" / "result7_mope_seed_stability_300_runs"
-OUTPUT_DIR = ROOT / "results" / "result7_mope_seed_stability_300"
+RUN_ROOT = ROOT / "results" / "result7_mope_seed_stability_fdg_pooled_reference_v1_runs"
+RUN_ID = datetime.now(timezone.utc).strftime("run_%Y%m%dT%H%M%S_%fZ")
+OUTPUT_DIR = (
+    ROOT / "results" / "result7_mope_seed_stability_fdg_pooled_reference_v1_consolidated" / RUN_ID
+)
 SEEDS = [42, 43, 44, 45, 46]
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Consolidate validated FDG pooled-reference seed runs."
+    )
+    parser.add_argument("--run-root", type=Path, default=RUN_ROOT)
+    parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
+    return parser.parse_args()
+
+
 def main() -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    checkpoint_dir = OUTPUT_DIR / "checkpoints"
+    args = parse_args()
+    args.output_dir.mkdir(parents=True, exist_ok=False)
+    checkpoint_dir = args.output_dir / "checkpoints"
     checkpoint_dir.mkdir(exist_ok=True)
     prediction_frames = []
     kernel_frames = []
     metric_frames = []
     run_frames = []
     parameters = {}
+    run_metadata = []
+    common_config = None
 
     for seed in SEEDS:
-        run_dir = RUN_ROOT / f"seed_{seed}"
+        run_dir = args.run_root / f"seed_{seed}"
         required = [
             "per_plot_predictions_by_seed.csv",
             "per_kernel_scores_by_seed.csv",
@@ -57,9 +74,29 @@ def main() -> None:
         kernel_frames.append(pd.read_csv(run_dir / required[1]))
         metric_frames.append(pd.read_csv(run_dir / required[2]))
         run_frames.append(pd.read_csv(run_dir / required[3]))
+        run_metadata.append(json.loads((run_dir / required[4]).read_text(encoding="utf-8")))
 
         source_checkpoint = run_dir / "checkpoints" / f"mope_seed_{seed}.pth"
         checkpoint = torch.load(source_checkpoint, map_location="cpu", weights_only=False)
+        mope.validate_checkpoint(checkpoint)
+        config = checkpoint["config"]
+        if config["seed"] != seed:
+            raise ValueError(f"Checkpoint seed differs from run directory: {run_dir}")
+        shared_keys = (
+            "model_schema", "normalization_reference", "epochs", "batch_size",
+            "learning_rate", "weight_decay", "ranking_margin", "aggregation_lambda",
+            "aggregation_reference_center", "cellpose_diameter",
+        )
+        shared_config = {key: config[key] for key in shared_keys}
+        if common_config is None:
+            common_config = shared_config
+        elif shared_config != common_config:
+            raise ValueError("Cannot consolidate seed runs with different model protocols.")
+        for key in ("epochs", "batch_size"):
+            if run_metadata[-1][key] != config[key]:
+                raise ValueError(f"Run metadata and checkpoint {key} differ: {run_dir}")
+        if run_metadata[-1]["dynamic_threshold_lambda"] != config["aggregation_lambda"]:
+            raise ValueError(f"Run metadata and checkpoint aggregation differ: {run_dir}")
         model = mope.MoPERanker()
         model.load_state_dict(checkpoint["model_state_dict"])
         parameters[seed] = parameter_vectors(model)
@@ -117,36 +154,37 @@ def main() -> None:
             }
         )
 
-    predictions.to_csv(OUTPUT_DIR / "per_plot_predictions_by_seed.csv", index=False)
-    kernels.to_csv(OUTPUT_DIR / "per_kernel_scores_by_seed.csv", index=False)
-    metrics.to_csv(OUTPUT_DIR / "per_seed_metrics.csv", index=False)
-    summary.to_csv(OUTPUT_DIR / "seed_summary_metrics.csv", index=False)
-    runs.to_csv(OUTPUT_DIR / "training_runs.csv", index=False)
-    parameter_stability.to_csv(OUTPUT_DIR / "parameter_stability.csv", index=False)
-    score_correlation.to_csv(OUTPUT_DIR / "pairwise_score_spearman_correlations.csv")
-    pd.DataFrame(gate_rows).to_csv(OUTPUT_DIR / "gate_stability.csv", index=False)
-    make_figure(metrics, OUTPUT_DIR / "mope_seed_stability.png")
+    predictions.to_csv(args.output_dir / "per_plot_predictions_by_seed.csv", index=False)
+    kernels.to_csv(args.output_dir / "per_kernel_scores_by_seed.csv", index=False)
+    metrics.to_csv(args.output_dir / "per_seed_metrics.csv", index=False)
+    summary.to_csv(args.output_dir / "seed_summary_metrics.csv", index=False)
+    runs.to_csv(args.output_dir / "training_runs.csv", index=False)
+    parameter_stability.to_csv(args.output_dir / "parameter_stability.csv", index=False)
+    score_correlation.to_csv(args.output_dir / "pairwise_score_spearman_correlations.csv")
+    pd.DataFrame(gate_rows).to_csv(args.output_dir / "gate_stability.csv", index=False)
+    make_figure(metrics, args.output_dir / "mope_seed_stability.png")
 
     metadata = {
         "purpose": "Full-protocol random-initialization stability analysis.",
         "seeds": SEEDS,
-        "epochs": 300,
-        "batch_size": 128,
-        "learning_rate": mope.LEARNING_RATE,
-        "weight_decay": mope.WEIGHT_DECAY,
-        "ranking_margin": mope.RANKING_MARGIN,
-        "dynamic_threshold_lambda": 0.25,
-        "n_healthy_valid_features": 395,
-        "n_diseased_valid_features": 384,
-        "n_test_plots": 80,
-        "n_test_kernels": 21835,
-        "source_run_root": str(RUN_ROOT),
+        "config": common_config,
+        "epochs": common_config["epochs"],
+        "batch_size": common_config["batch_size"],
+        "learning_rate": common_config["learning_rate"],
+        "weight_decay": common_config["weight_decay"],
+        "ranking_margin": common_config["ranking_margin"],
+        "dynamic_threshold_lambda": common_config["aggregation_lambda"],
+        "n_healthy_valid_features": run_metadata[0]["n_healthy_valid_features"],
+        "n_diseased_valid_features": run_metadata[0]["n_diseased_valid_features"],
+        "n_test_plots": len(predictions) // len(SEEDS),
+        "n_test_kernels": len(kernels) // len(SEEDS),
+        "source_run_root": str(args.run_root),
         "note": "The 80 evaluation labels were not used for fitting or threshold calibration.",
     }
-    (OUTPUT_DIR / "experiment_metadata.json").write_text(
+    (args.output_dir / "experiment_metadata.json").write_text(
         json.dumps(metadata, indent=2), encoding="utf-8"
     )
-    print(f"Merged full 300-epoch seed experiment into {OUTPUT_DIR}")
+    print(f"Merged {common_config['epochs']}-epoch seed experiment into {args.output_dir}")
 
 
 if __name__ == "__main__":

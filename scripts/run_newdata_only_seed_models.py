@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import json
-import os
-import shutil
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
@@ -24,19 +23,14 @@ PNG_ROOT = ROOT / "data" / "seeds_png"
 HEALTH_DIR = PNG_ROOT / "health"
 DISEASE_DIR = PNG_ROOT / "disease"
 TEST_DIR = PNG_ROOT / "test"
-OUT_ROOT = ROOT / "output_results" / "current_seed_models"
+RUN_ID = datetime.now(timezone.utc).strftime("run_%Y%m%dT%H%M%S_%fZ")
+OUT_ROOT = ROOT / "output_results" / "fdg_pooled_reference_v1" / RUN_ID
 TRAIN_EXAMPLES_DIR = OUT_ROOT / "training_examples"
 TRAIN_HEALTHY_DIR = TRAIN_EXAMPLES_DIR / "Healthy"
 TRAIN_DISEASED_DIR = TRAIN_EXAMPLES_DIR / "Diseased"
 EXTRACT_CACHE_DIR = OUT_ROOT / "seedpose_cache"
 MOPE_OUT = OUT_ROOT / "MoPE"
 RESNET_OUT = OUT_ROOT / "ResNet18"
-
-
-def reset_dir(path: Path) -> None:
-    if path.exists():
-        shutil.rmtree(path)
-    path.mkdir(parents=True, exist_ok=True)
 
 
 def valid_area(area: int) -> bool:
@@ -91,6 +85,7 @@ def extract_kernels_from_dir(src_dir: Path, dst_dir: Path, cache_dir: Path) -> d
 
 
 def train_mope_new_only() -> dict:
+    mope.set_training_seed()
     healthy_feats, feature_names = mope.extract_features_from_dir(str(TRAIN_HEALTHY_DIR))
     diseased_feats, _ = mope.extract_features_from_dir(str(TRAIN_DISEASED_DIR))
     healthy_norm, diseased_norm, feat_mean, feat_std = mope.normalize_features(healthy_feats, diseased_feats)
@@ -102,7 +97,13 @@ def train_mope_new_only() -> dict:
         weight_decay=mope.WEIGHT_DECAY,
         margin=mope.RANKING_MARGIN,
     )
-    history = trainer.train(healthy_norm, diseased_norm, num_epochs=mope.NUM_EPOCHS, verbose=True)
+    history = trainer.train(
+        healthy_norm,
+        diseased_norm,
+        num_epochs=mope.NUM_EPOCHS,
+        batch_size=mope.BATCH_SIZE,
+        verbose=True,
+    )
 
     calibrator = mope.SeverityCalibrator(model)
     thresholds = calibrator.calibrate(healthy_norm, diseased_norm)
@@ -124,12 +125,7 @@ def train_mope_new_only() -> dict:
             "history": history,
             "loo_binary_acc": None,
             "loo_ranking_acc": None,
-            "config": {
-                "color_dim": len(mope.COLOR_INDICES),
-                "texture_dim": len(mope.TEXTURE_INDICES),
-                "morph_dim": len(mope.MORPH_INDICES),
-                "ranking_margin": mope.RANKING_MARGIN,
-            },
+            "config": mope.build_model_config(model),
         },
         MOPE_OUT / "mope_model.pth",
     )
@@ -164,12 +160,11 @@ def infer_mope_test() -> list[dict]:
         )
         if out is not None:
             score_arr = np.array([r["severity_score"] for r in out["results"]], dtype=np.float64)
-            train_h_n = calibrator.h_stats.get("n", 1)
-            train_d_n = calibrator.d_stats.get("n", 1)
-            ref_mean = (
-                calibrator.h_stats["mean"] * train_h_n + calibrator.d_stats["mean"] * train_d_n
-            ) / (train_h_n + train_d_n)
-            vsk_threshold = calibrator.d_stats["mean"] + 0.25 * (float(score_arr.mean()) - ref_mean)
+            vsk_threshold = mope.compute_vsk_threshold(
+                healthy_mean=calibrator.h_stats["mean"],
+                diseased_mean=calibrator.d_stats["mean"],
+                target_mean=float(score_arr.mean()),
+            )
             predicted_vsk_pct = float(np.mean(score_arr >= vsk_threshold) * 100.0)
             results.append(
                 {
@@ -184,6 +179,7 @@ def infer_mope_test() -> list[dict]:
 
 
 def train_resnet_new_only() -> dict:
+    mope.set_training_seed()
     all_samples = []
     for path in sorted(TRAIN_HEALTHY_DIR.glob("*.png")):
         all_samples.append((path, 0))
@@ -293,10 +289,10 @@ def infer_resnet_test() -> list[dict]:
 
 
 def main() -> None:
-    OUT_ROOT.mkdir(parents=True, exist_ok=True)
-    reset_dir(TRAIN_EXAMPLES_DIR)
-    reset_dir(MOPE_OUT)
-    reset_dir(RESNET_OUT)
+    OUT_ROOT.mkdir(parents=True, exist_ok=False)
+    TRAIN_EXAMPLES_DIR.mkdir()
+    MOPE_OUT.mkdir()
+    RESNET_OUT.mkdir()
     EXTRACT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     health_extract = extract_kernels_from_dir(HEALTH_DIR, TRAIN_HEALTHY_DIR, EXTRACT_CACHE_DIR)

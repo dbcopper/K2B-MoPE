@@ -1,12 +1,12 @@
 # few_shot_cellpose_mope_ranking.py
 """
 MoPE-Rank: Mixture of Phenotypic Experts for Pairwise Ranking-based
-Fusarium Head Blight Severity Assessment in Wheat Kernels
+Wheat-Kernel Phenotype Scoring and Plot-Level VSK Estimation
 
 Key Innovation:
 1. Three domain-specific experts (Color, Texture, Morphology) with adaptive gating
 2. Pairwise ranking loss trained with only binary labels (healthy/diseased)
-3. Continuous severity score with data-driven threshold determination
+3. Ordered latent kernel score with development-locked VSK aggregation
 4. Interpretable expert contribution analysis per kernel
 """
 import os
@@ -30,10 +30,13 @@ matplotlib.rcParams.update({
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import time
 import csv
+import random
 import warnings
+import importlib.metadata as importlib_metadata
 from itertools import product
 from skimage.feature import local_binary_pattern, graycomatrix, graycoprops
 from skimage import color as skcolor
@@ -44,7 +47,12 @@ warnings.filterwarnings('ignore')
 # ==========================================
 CELLPOSE_MODEL = "cyto"
 CELLPOSE_FLOW_THRESHOLD = 0.4
-CELLPOSE_FIXED_DIAMETER = 116
+# The 80-plot evaluation feature table and mask cache were generated with the
+# fixed Cellpose diameter below.  Keep the public inference default aligned
+# with those auditable artifacts; alternative diameters must be reported as
+# explicit sensitivity/benchmark settings.
+CELLPOSE_FIXED_DIAMETER = 95
+CELLPOSE_CACHE_SCHEMA = f"cellpose3_{CELLPOSE_MODEL}_d{CELLPOSE_FIXED_DIAMETER}_v1"
 ROI_DOWNSAMPLE_MAX_SIDE = 1600
 EXAMPLES_DIR = "./examples"
 HEALTHY_EXAMPLES_DIR = os.path.join(EXAMPLES_DIR, "Healthy")
@@ -53,9 +61,140 @@ DISEASED_EXAMPLES_DIR = os.path.join(EXAMPLES_DIR, "Diseased")
 # MoPE Training Config
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
-NUM_EPOCHS = 300
+# Fixed schedule and seed specified in the revised manuscript, Section 2.3.1.
+NUM_EPOCHS = 16
+TRAINING_SEED = 42
+NORMALIZATION_EPSILON = 1e-10
 RANKING_MARGIN = 0.3
 BATCH_SIZE = 128
+DEFAULT_BASE_OUTPUT = os.path.join(
+    "output_results", "MoPE_Ranking_FDG_PooledReference_v1"
+)
+
+# Revision model schema.  Increment this when the parameterisation or the
+# feature-standardisation contract changes, so legacy checkpoints are not
+# silently interpreted as the manuscript-defined model.
+MODEL_SCHEMA = "fdg_pooled_reference_v1"
+NORMALIZATION_REFERENCE = "all_training"
+# Operational aggregation coefficient.  Revision experiments may override this
+# value explicitly after development-only selection, but every inference path
+# uses the same class-balanced reference midpoint and coefficient definition.
+VSK_THRESHOLD_LAMBDA = 0.25
+
+
+def create_cellpose_model(use_gpu=False):
+    """Construct the named v3 model; never silently replace cyto with CPSAM."""
+    try:
+        installed_version = importlib_metadata.version('cellpose')
+        major_version = int(installed_version.split('.')[0])
+    except (importlib_metadata.PackageNotFoundError, ValueError) as error:
+        raise RuntimeError(
+            "New segmentation requires Cellpose 3 with the named cyto model. "
+            "Install 'cellpose>=3.1,<4' in the analysis environment."
+        ) from error
+    if major_version != 3:
+        raise RuntimeError(
+            f"Cellpose {installed_version} is incompatible with the cyto "
+            "segmentation protocol. Install 'cellpose>=3.1,<4'; Cellpose 4 "
+            "ignores model_type and must not silently substitute CPSAM."
+        )
+    from cellpose import models
+    if not hasattr(models, 'Cellpose'):
+        raise RuntimeError("The installed Cellpose package lacks its named v3 API")
+    return models.Cellpose(gpu=bool(use_gpu), model_type=CELLPOSE_MODEL)
+
+
+def set_training_seed(seed=TRAINING_SEED):
+    """Seed CPU model initialization and pair sampling without starting CUDA."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def build_model_config(model, epochs=NUM_EPOCHS, batch_size=BATCH_SIZE,
+                       seed=TRAINING_SEED):
+    """Describe the implementation used by a newly trained pooled FDG model."""
+    return {
+        'model_schema': MODEL_SCHEMA,
+        'normalization_reference': NORMALIZATION_REFERENCE,
+        'normalization_epsilon': NORMALIZATION_EPSILON,
+        'normalization_ddof': 0,
+        'color_dim': model.expert_color.fc.in_features,
+        'texture_dim': model.expert_texture.fc.in_features,
+        'morph_dim': model.expert_morph.fc.in_features,
+        'gating_rule': 'mean_absolute_deviation_single_positive_temperature',
+        'optimizer': 'Adam',
+        'learning_rate': LEARNING_RATE,
+        'weight_decay': WEIGHT_DECAY,
+        'epochs': int(epochs),
+        'batch_size': int(batch_size),
+        'seed': int(seed),
+        'ranking_margin': RANKING_MARGIN,
+        'aggregation_reference_center': 'class_balanced_anchor_midpoint',
+        'aggregation_lambda': VSK_THRESHOLD_LAMBDA,
+        'cellpose_model': CELLPOSE_MODEL,
+        'cellpose_diameter': CELLPOSE_FIXED_DIAMETER,
+        'segmentation_cache_schema': CELLPOSE_CACHE_SCHEMA,
+        'learned_temperature': float(
+            model.gating.temperature.detach().cpu().item()
+        ),
+    }
+
+
+def validate_checkpoint(checkpoint):
+    """Reject incompatible gates and normalization rather than relabel weights."""
+    if not isinstance(checkpoint, dict):
+        raise RuntimeError("MoPE checkpoint must contain a state/config mapping")
+    config = checkpoint.get('config', {})
+    if not isinstance(config, dict) or config.get('model_schema') != MODEL_SCHEMA:
+        found = config.get('model_schema') if isinstance(config, dict) else None
+        raise RuntimeError(
+            "Incompatible MoPE checkpoint: expected model schema "
+            f"'{MODEL_SCHEMA}', found '{found or 'unversioned'}'. "
+            "Retrain into a new output directory; legacy 25-to-3 gates and "
+            "healthy-only checkpoints cannot be converted by changing metadata."
+        )
+    if config.get('normalization_reference') != NORMALIZATION_REFERENCE:
+        raise RuntimeError(
+            "Checkpoint normalization must use pooled Healthy and Diseased "
+            "training kernels (all_training). Retraining is required."
+        )
+    state = checkpoint.get('model_state_dict', {})
+    if not isinstance(state, dict) or any(k.startswith('gating.fc.') for k in state):
+        raise RuntimeError("Legacy linear gating weights are incompatible with scalar FDG")
+    temperature = state.get('gating.raw_temperature')
+    if (not isinstance(temperature, torch.Tensor) or temperature.numel() != 1
+            or not bool(torch.isfinite(temperature).all())):
+        raise RuntimeError("Checkpoint must contain one finite FDG temperature parameter")
+    mean = np.asarray(checkpoint.get('feat_mean'), dtype=np.float64)
+    scale = np.asarray(checkpoint.get('feat_std'), dtype=np.float64)
+    expected_dim = sum(config.get(k, 0) for k in ('color_dim', 'texture_dim', 'morph_dim'))
+    if (mean.shape != (expected_dim,) or scale.shape != mean.shape
+            or expected_dim != 25 or not np.isfinite(mean).all()
+            or not np.isfinite(scale).all() or not (scale > 0).all()):
+        raise RuntimeError("Checkpoint requires 25 finite training means and positive scales")
+    return config
+
+
+def compute_vsk_threshold(healthy_mean, diseased_mean, target_mean,
+                          lambda_value=VSK_THRESHOLD_LAMBDA):
+    """Return the class-balanced dynamic threshold used for VSK aggregation.
+
+    The reference centre gives the healthy and diseased anchor classes equal
+    weight, irrespective of how many technical kernel crops were selected from
+    either class.  ``lambda_value`` must be fixed without evaluation-label use.
+    """
+    values = np.asarray(
+        [healthy_mean, diseased_mean, target_mean, lambda_value],
+        dtype=np.float64,
+    )
+    if not np.isfinite(values).all():
+        raise ValueError("Threshold inputs must be finite")
+    reference_midpoint = (float(healthy_mean) + float(diseased_mean)) / 2.0
+    return float(
+        float(diseased_mean)
+        + float(lambda_value) * (float(target_mean) - reference_midpoint)
+    )
 
 # Feature group definitions (indices into the 25-dim feature vector)
 COLOR_INDICES = list(range(0, 11))    # 11 color features
@@ -271,7 +410,7 @@ def extract_features_from_dir(examples_dir):
 # ==========================================
 
 class PhenotypicExpert(nn.Module):
-    """Single expert: maps domain-specific features to a severity score"""
+    """Single expert mapping domain-specific features to an ordered score."""
     def __init__(self, input_dim):
         super().__init__()
         self.fc = nn.Linear(input_dim, 1)
@@ -284,14 +423,14 @@ class DeviationGuidedGating(nn.Module):
     """
     Feature-Deviation-Guided Gating Network.
 
-    Gating weights are driven by a biologically motivated, parameter-free
+    Gating weights are driven by a parameter-free feature-deviation
     deviation signal:
       signal_k = mean( |x_k| )
 
-    After z-score normalisation, healthy kernels cluster near 0 and diseased
-    kernels exhibit larger absolute feature values. The expert whose feature
-    group deviates most from the healthy baseline therefore receives the
-    highest gating weight -- no labelled data required to compute this prior.
+    Features use pooled Healthy and Diseased training statistics. Absolute
+    deviation is a heuristic measure of departure from that pooled reference,
+    not a disease probability or a biological severity measurement. The group
+    with the largest mean absolute standardized deviation receives most weight.
 
     A single learnable temperature T controls the sharpness of expert
     selection (T → 0: hard assignment to one expert; T → ∞: equal weights).
@@ -300,23 +439,60 @@ class DeviationGuidedGating(nn.Module):
 
     gate = softmax( mean|x_k| / T )
     """
-    def __init__(self, input_dim=25):
+    def __init__(self, input_dim=25, initial_temperature=1.0,
+                 minimum_temperature=1e-4):
         super().__init__()
-        self.fc = nn.Linear(input_dim, 3)
+        # ``input_dim`` is retained for API/checkpoint-construction
+        # compatibility.  FDG itself only needs the three feature groups.
+        self.input_dim = input_dim
+        self.minimum_temperature = float(minimum_temperature)
+        if (not np.isfinite(self.minimum_temperature)
+                or self.minimum_temperature <= 0
+                or not np.isfinite(initial_temperature)
+                or initial_temperature <= self.minimum_temperature):
+            raise ValueError("initial_temperature must exceed minimum_temperature")
 
-    def forward(self, color_feats, texture_feats, morph_feats, x_full):
-        return torch.softmax(self.fc(x_full), dim=-1)
+        # Softplus provides an everywhere-differentiable positive temperature.
+        # Initialise the unconstrained parameter so temperature starts exactly
+        # at the requested value (up to floating-point precision).
+        target = torch.tensor(
+            initial_temperature - self.minimum_temperature,
+            dtype=torch.float32,
+        )
+        self.raw_temperature = nn.Parameter(target + torch.log(-torch.expm1(-target)))
+
+    @property
+    def temperature(self):
+        """Positive scalar temperature used to soften the deviation signals."""
+        return F.softplus(self.raw_temperature) + self.minimum_temperature
+
+    def forward(self, color_feats, texture_feats, morph_feats, x_full=None):
+        del x_full  # Kept only so existing callers retain the same signature.
+        groups = (color_feats, texture_feats, morph_feats)
+        if any(group.ndim != 2 or group.shape[1] == 0 for group in groups):
+            raise ValueError("Each FDG feature group must be a non-empty 2D tensor")
+        if len({group.shape[0] for group in groups}) != 1:
+            raise ValueError("FDG feature groups must have the same batch size")
+        if any(not bool(torch.isfinite(group).all()) for group in groups):
+            raise ValueError("FDG feature groups must contain finite values")
+
+        deviation_signals = torch.stack(
+            [group.abs().mean(dim=-1) for group in groups],
+            dim=-1,
+        )
+        return torch.softmax(deviation_signals / self.temperature, dim=-1)
 
 
 class MoPERanker(nn.Module):
     """
-    Mixture of Phenotypic Experts for FHB severity ranking.
+    Mixture of Phenotypic Experts for kernel phenotype ranking.
 
     Three domain experts (Color / Texture / Morphology) each map their
-    respective feature group to a scalar severity score via a linear layer
+    respective feature group to a scalar ordered score via a linear layer
     + sigmoid.  A DeviationGuidedGating network combines their scores using
-    weights proportional to the per-group feature deviation from the healthy
-    baseline, refined by a small learned adjustment.
+    weights obtained from per-group deviation from the pooled training
+    reference. Its sole learned gating parameter is a positive scalar
+    temperature controlling how strongly the largest deviation is favoured.
     """
     def __init__(self, color_dim=11, texture_dim=11, morph_dim=3):
         super().__init__()
@@ -332,7 +508,7 @@ class MoPERanker(nn.Module):
         Args:
             x: [batch, 25] z-score normalised feature vector
         Returns:
-            severity:      [batch, 1] continuous severity score in (0, 1)
+            severity:      [batch, 1] ordered latent score in (0, 1)
             gates:         [batch, 3] gating weights (color, texture, morph)
             expert_scores: [batch, 3] individual expert scores
         """
@@ -528,7 +704,11 @@ class PairwiseRankingTrainer:
 # ==========================================
 
 class SeverityCalibrator:
-    """Determine severity level thresholds from training data distribution"""
+    """Create visualization-only score bands from the two training anchors.
+
+    These bands do not constitute validated biological severity categories;
+    the primary reported endpoint is the plot-level VSK estimate.
+    """
 
     def __init__(self, model):
         self.model = model
@@ -593,7 +773,7 @@ class SeverityCalibrator:
         return self.thresholds
 
     def get_level(self, score):
-        """Map continuous score to severity level"""
+        """Map an ordered score to a visualization-only anchor-derived band."""
         if score < self.thresholds['healthy_upper']:
             return 0, 'Healthy'
         elif score < self.thresholds['mild_upper']:
@@ -702,12 +882,14 @@ def plot_severity_analysis(results, calibrator, output_path):
     mean_score = float(np.mean(score_arr))
     std_score = float(np.std(score_arr))
     n_kernels = len(score_arr)
-    train_h_n = calibrator.h_stats.get('n', 107)
-    train_d_n = calibrator.d_stats.get('n', 34)
-    ref_mean = (
-        calibrator.h_stats['mean'] * train_h_n + calibrator.d_stats['mean'] * train_d_n
-    ) / (train_h_n + train_d_n)
-    vsk_threshold = calibrator.d_stats['mean'] + 0.25 * (mean_score - ref_mean)
+    # Use a class-balanced reference midpoint.  Weighting this midpoint by the
+    # number of kernel crops would make the operating rule depend on arbitrary
+    # anchor-set class counts and would disagree with the revision analyses.
+    vsk_threshold = compute_vsk_threshold(
+        calibrator.h_stats['mean'],
+        calibrator.d_stats['mean'],
+        mean_score,
+    )
     predicted_vsk_pct = float(np.mean(score_arr >= vsk_threshold) * 100.0)
     above_n = int(np.sum(score_arr >= vsk_threshold))
     below_n = int(n_kernels - above_n)
@@ -740,7 +922,7 @@ def plot_severity_analysis(results, calibrator, output_path):
         fontweight='bold',
         bbox=dict(boxstyle='round,pad=0.15', facecolor='white', edgecolor='none', alpha=0.8),
     )
-    ax.set_xlabel('Severity Score', fontsize=14)
+    ax.set_xlabel('Ordered Kernel Score', fontsize=14)
     ax.set_ylabel('Count', fontsize=14)
     ax.set_title(f'Score Distribution and Threshold\nVSK score = {predicted_vsk_pct:.1f}% ({above_n}/{n_kernels})', fontsize=16)
     ax.tick_params(axis='both', labelsize=13)
@@ -770,7 +952,7 @@ def plot_severity_analysis(results, calibrator, output_path):
     ax.scatter(scores, expert_scores[:, 2], alpha=0.5, s=30,
               c='#2ecc71', label='Morphology Expert')
     ax.plot([0, 1], [0, 1], 'k--', alpha=0.3)
-    ax.set_xlabel('Final Severity Score', fontsize=14)
+    ax.set_xlabel('Final Ordered Score', fontsize=14)
     ax.set_ylabel('Individual Expert Score', fontsize=14)
     ax.set_title('Expert Scores vs Final Severity', fontsize=16)
     ax.tick_params(axis='both', labelsize=13)
@@ -841,7 +1023,7 @@ def plot_severity_strip(results, output_path, max_seeds=48):
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=axes, orientation='vertical',
                         fraction=0.02, pad=0.02, aspect=30)
-    cbar.set_label('Severity Score', fontsize=13)
+    cbar.set_label('Ordered Kernel Score', fontsize=13)
 
     plt.savefig(output_path, dpi=200, bbox_inches='tight')
     plt.close()
@@ -999,10 +1181,20 @@ def stitch_roi_masks(cellpose_model, gray, rois, diameter, flow_threshold=CELLPO
         crop = gray[y1:y2, x1:x2]
         if crop.size == 0:
             continue
-        roi_masks, _, _ = cellpose_model.eval(
+        # Cellpose 3.x ``Cellpose.eval`` returns four values, whereas
+        # ``CellposeModel.eval`` returns three.  Select the mask payload rather
+        # than relying on tuple arity so the explicitly requested model below
+        # works across both APIs.
+        cellpose_result = cellpose_model.eval(
             crop,
             diameter=diameter,
-            flow_threshold=flow_threshold
+            flow_threshold=flow_threshold,
+            channels=[0, 0],
+        )
+        roi_masks = (
+            cellpose_result[0]
+            if isinstance(cellpose_result, (tuple, list))
+            else cellpose_result
         )
         if roi_masks is None or np.max(roi_masks) == 0:
             continue
@@ -1016,11 +1208,46 @@ def stitch_roi_masks(cellpose_model, gray, rois, diameter, flow_threshold=CELLPO
     return full_masks
 
 
-def normalize_features(healthy_feats, diseased_feats):
-    """Z-score normalization using training set statistics"""
-    all_feats = np.vstack([healthy_feats, diseased_feats])
-    mean = all_feats.mean(axis=0)
-    std = all_feats.std(axis=0) + 1e-10
+def normalize_features(healthy_feats, diseased_feats, reference="all_training",
+                       epsilon=NORMALIZATION_EPSILON):
+    """Z-score features using statistics from the training reference only.
+
+    Parameters
+    ----------
+    healthy_feats, diseased_feats : array-like
+        Kernel-level training features.  Evaluation images are never used to
+        estimate the transformation.
+    reference : {"healthy", "all_training"}
+        The manuscript default, ``"all_training"``, pools both training classes
+        with each kernel contributing once. ``"healthy"`` is an explicit
+        alternative for separate sensitivity analyses; it must not be labelled
+        with the pooled-reference checkpoint schema.
+    epsilon : float
+        Positive constant added to the population standard deviation in Eq. (8).
+        The returned ``std`` is this effective denominator, reused at inference.
+    """
+    healthy_feats = np.asarray(healthy_feats, dtype=np.float64)
+    diseased_feats = np.asarray(diseased_feats, dtype=np.float64)
+    if healthy_feats.ndim != 2 or diseased_feats.ndim != 2:
+        raise ValueError("Training feature arrays must both be two-dimensional")
+    if healthy_feats.shape[1] != diseased_feats.shape[1]:
+        raise ValueError("Healthy and diseased features must have equal dimensions")
+    if healthy_feats.shape[0] == 0 or diseased_feats.shape[0] == 0:
+        raise ValueError("Both training classes must contain at least one kernel")
+    if not np.isfinite(healthy_feats).all() or not np.isfinite(diseased_feats).all():
+        raise ValueError("Training feature arrays must contain finite values")
+    if not np.isfinite(epsilon) or epsilon <= 0:
+        raise ValueError("epsilon must be positive")
+
+    if reference == "healthy":
+        reference_feats = healthy_feats
+    elif reference == "all_training":
+        reference_feats = np.vstack([healthy_feats, diseased_feats])
+    else:
+        raise ValueError("reference must be 'healthy' or 'all_training'")
+
+    mean = reference_feats.mean(axis=0)
+    std = reference_feats.std(axis=0, ddof=0) + epsilon
     return (healthy_feats - mean) / std, (diseased_feats - mean) / std, mean, std
 
 
@@ -1030,6 +1257,7 @@ def normalize_features(healthy_feats, diseased_feats):
 
 def train_and_save(base_output, stages_dir):
     """Train MoPE model from examples and save everything"""
+    set_training_seed()
     model_path = os.path.join(base_output, 'mope_model.pth')
     feats_path = os.path.join(base_output, 'training_features.npz')
 
@@ -1051,7 +1279,7 @@ def train_and_save(base_output, stages_dir):
 
     # Normalize
     healthy_norm, diseased_norm, feat_mean, feat_std = normalize_features(
-        healthy_feats, diseased_feats
+        healthy_feats, diseased_feats, reference=NORMALIZATION_REFERENCE
     )
 
     # Save extracted features
@@ -1080,11 +1308,13 @@ def train_and_save(base_output, stages_dir):
     plot_training_history(history, os.path.join(stages_dir, 'training_history.png'))
     print(f"\n  Final Pairwise Ranking Accuracy: {history['pair_acc'][-1]:.4f}")
 
-    # Step 2b: LOO Cross-validation
-    print("\n[Train Step 2b] Leave-One-Out Cross-validation...")
-    loo_binary_acc, loo_ranking_acc = trainer.evaluate_loo(
-        healthy_norm, diseased_norm, num_epochs=200
-    )
+    # Do not report kernel-level leave-one-out validation here.  The labelled
+    # kernels are nested within eight parent images, so treating each kernel as
+    # an independent fold would leak parent-image appearance and overstate
+    # precision.  Parent-image-grouped validation is run by the revision
+    # experiment workflow instead.
+    print("\n[Train Step 2b] Kernel-level LOO skipped (nested parent images).")
+    loo_binary_acc, loo_ranking_acc = None, None
 
     # Step 3: Calibrate thresholds
     print("\n[Train Step 3] Calibrating severity thresholds...")
@@ -1104,12 +1334,7 @@ def train_and_save(base_output, stages_dir):
         'history': history,
         'loo_binary_acc': loo_binary_acc,
         'loo_ranking_acc': loo_ranking_acc,
-        'config': {
-            'color_dim': len(COLOR_INDICES),
-            'texture_dim': len(TEXTURE_INDICES),
-            'morph_dim': len(MORPH_INDICES),
-            'ranking_margin': RANKING_MARGIN,
-        }
+        'config': build_model_config(model),
     }, model_path)
     print(f"\n  Model saved: {model_path}")
 
@@ -1125,9 +1350,11 @@ def load_model(base_output):
         return None
 
     print(f"\n  Found saved model: {model_path}")
-    checkpoint = torch.load(model_path, weights_only=False)
-
-    config = checkpoint.get('config', {})
+    checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+    config = validate_checkpoint(checkpoint)
+    if (config.get('aggregation_reference_center') != 'class_balanced_anchor_midpoint'
+            or config.get('aggregation_lambda') != VSK_THRESHOLD_LAMBDA):
+        raise RuntimeError("Checkpoint aggregation differs from the primary VSK rule")
     model = MoPERanker(
         color_dim=config.get('color_dim', len(COLOR_INDICES)),
         texture_dim=config.get('texture_dim', len(TEXTURE_INDICES)),
@@ -1187,7 +1414,7 @@ def process_image(image_path, model, calibrator, feat_mean, feat_std,
     cache_dir = os.path.join(base_output, 'cache')
     os.makedirs(cache_dir, exist_ok=True)
     cache_path = os.path.join(cache_dir,
-                              f"cellpose_betterroi_d{CELLPOSE_FIXED_DIAMETER}_{img_name}_{gray.shape[0]}x{gray.shape[1]}.npz")
+                              f"{CELLPOSE_CACHE_SCHEMA}_{img_name}_{gray.shape[0]}x{gray.shape[1]}.npz")
 
     if os.path.exists(cache_path):
         data = np.load(cache_path)
@@ -1195,19 +1422,13 @@ def process_image(image_path, model, calibrator, feat_mean, feat_std,
         num_seeds = int(masks.max())
         print(f"  Loaded from cache: {num_seeds} seeds")
     else:
-        use_gpu = torch.cuda.is_available()
-        from cellpose import models
-        try:
-            cellpose_model = models.CellposeModel(gpu=use_gpu)
-        except:
-            cellpose_model = models.Cellpose(gpu=use_gpu, model_type=CELLPOSE_MODEL)
-
         diameter = CELLPOSE_FIXED_DIAMETER
         print(f"  Using fixed diameter: {diameter}")
 
         if len(candidate_rois) == 0:
             masks = np.zeros(gray.shape, dtype=np.uint32)
         else:
+            cellpose_model = create_cellpose_model(use_gpu=torch.cuda.is_available())
             masks = stitch_roi_masks(
                 cellpose_model,
                 gray,
@@ -1289,12 +1510,11 @@ def process_image(image_path, model, calibrator, feat_mean, feat_std,
         return None
 
     score_arr = np.array([r['severity_score'] for r in results], dtype=np.float64)
-    train_h_n = calibrator.h_stats.get('n', 107)
-    train_d_n = calibrator.d_stats.get('n', 34)
-    ref_mean = (
-        calibrator.h_stats['mean'] * train_h_n + calibrator.d_stats['mean'] * train_d_n
-    ) / (train_h_n + train_d_n)
-    vsk_threshold = calibrator.d_stats['mean'] + 0.25 * (float(score_arr.mean()) - ref_mean)
+    vsk_threshold = compute_vsk_threshold(
+        calibrator.h_stats['mean'],
+        calibrator.d_stats['mean'],
+        float(score_arr.mean()),
+    )
     vsk_positive = int(np.sum(score_arr >= vsk_threshold))
     vsk_negative = int(len(score_arr) - vsk_positive)
 
@@ -1389,14 +1609,16 @@ def process_image(image_path, model, calibrator, feat_mean, feat_std,
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description='MoPE-Rank Severity Assessment')
+    parser = argparse.ArgumentParser(description='MoPE-Rank Ordered Scoring and VSK Estimation')
     parser.add_argument('--images', nargs='+', default=['./origin.jpg'],
                        help='Image paths to process')
     parser.add_argument('--retrain', action='store_true',
                        help='Force retrain even if model exists')
+    parser.add_argument('--output-dir', default=DEFAULT_BASE_OUTPUT,
+                       help='Model/result directory (defaults to the revised FDG schema)')
     args = parser.parse_args()
 
-    base_output = os.path.join('output_results', 'MoPE_Ranking')
+    base_output = args.output_dir
     stages_dir = os.path.join(base_output, 'stages')
     os.makedirs(stages_dir, exist_ok=True)
 

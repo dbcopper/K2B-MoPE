@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import random
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import matplotlib
@@ -30,7 +30,10 @@ DEFAULT_KERNEL_CSV = (
 DEFAULT_PLOT_CSV = (
     ROOT / "results" / "result2" / "per_plot" / "table8_per_plot_predictions.csv"
 )
-DEFAULT_OUTPUT_DIR = ROOT / "results" / "result7_mope_seed_stability"
+RUN_ID = datetime.now(timezone.utc).strftime("run_%Y%m%dT%H%M%S_%fZ")
+DEFAULT_OUTPUT_DIR = (
+    ROOT / "results" / "result7_mope_seed_stability_fdg_pooled_reference_v1" / RUN_ID
+)
 DEFAULT_TRAINING_ROOT = (
     ROOT / "output_results" / "current_seed_models" / "training_examples"
 )
@@ -56,9 +59,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    mope.set_training_seed(seed)
 
 
 def score_model(
@@ -106,11 +107,15 @@ def aggregate_plot_predictions(
 ) -> pd.DataFrame:
     work = kernel_df[["year", "plot"]].copy()
     work["mope_score"] = scores
-    reference_mean = (healthy_mean + diseased_mean) / 2.0
     rows = []
     for (year, plot), group in work.groupby(["year", "plot"], sort=False):
         values = group["mope_score"].to_numpy(dtype=float)
-        threshold = diseased_mean + lambda_value * (values.mean() - reference_mean)
+        threshold = mope.compute_vsk_threshold(
+            healthy_mean=healthy_mean,
+            diseased_mean=diseased_mean,
+            target_mean=float(values.mean()),
+            lambda_value=lambda_value,
+        )
         rows.append(
             {
                 "year": int(year),
@@ -130,7 +135,7 @@ def parameter_vectors(model: mope.MoPERanker) -> dict[str, np.ndarray]:
         "color_expert": "expert_color.fc.",
         "texture_expert": "expert_texture.fc.",
         "morphology_expert": "expert_morph.fc.",
-        "gating": "gating.fc.",
+        "gating": "gating.raw_temperature",
     }
     vectors = {}
     for name, prefix in prefixes.items():
@@ -139,6 +144,8 @@ def parameter_vectors(model: mope.MoPERanker) -> dict[str, np.ndarray]:
             for key, tensor in state.items()
             if key.startswith(prefix)
         ]
+        if not values:
+            raise ValueError(f"Missing parameter block {name!r} in the FDG model.")
         vectors[name] = np.concatenate(values)
     return vectors
 
@@ -189,7 +196,7 @@ def make_figure(metrics: pd.DataFrame, output_path: Path) -> None:
 
 def main() -> None:
     args = parse_args()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    args.output_dir.mkdir(parents=True, exist_ok=False)
     checkpoint_dir = args.output_dir / "checkpoints"
     checkpoint_dir.mkdir(exist_ok=True)
     (
@@ -271,6 +278,13 @@ def main() -> None:
 
         parameter_by_seed[seed] = parameter_vectors(model)
         checkpoint_path = checkpoint_dir / f"mope_seed_{seed}.pth"
+        checkpoint_config = mope.build_model_config(
+            model,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            seed=seed,
+        )
+        checkpoint_config["aggregation_lambda"] = args.lambda_value
         torch.save(
             {
                 "seed": seed,
@@ -281,6 +295,8 @@ def main() -> None:
                 "history": history,
                 "healthy_score_mean": h_mean,
                 "diseased_score_mean": d_mean,
+                "config": checkpoint_config,
+                "aggregation_lambda": args.lambda_value,
             },
             checkpoint_path,
         )
